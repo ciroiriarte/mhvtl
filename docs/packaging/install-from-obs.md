@@ -34,9 +34,18 @@ On openSUSE use the KMP. Elsewhere the module comes from DKMS.
 | Rocky Linux 10, RHEL 10 | `RockyLinux_10` | DKMS |
 | AlmaLinux 9 | `AlmaLinux_9` | DKMS |
 | AlmaLinux 10 | `AlmaLinux_10` | DKMS |
+| Debian 12 | `Debian_12` | DKMS (see below) |
 | Debian 13 | `Debian_13` | DKMS |
 | Ubuntu 24.04 LTS | `xUbuntu_24.04` | DKMS |
 | Ubuntu 26.04 LTS | `xUbuntu_26.04` | DKMS |
+| Proxmox VE 9 | `Debian_13` | DKMS |
+| Proxmox VE 8 | `Debian_12` | DKMS (see below) |
+
+**Debian 12 / Proxmox VE 8:** the `Debian_12` repository does not publish yet. Bookworm's debhelper only
+looks for unit files in `/lib/systemd/system`, while mhVTL installs them in
+`/usr/lib/systemd/system`, so the build fails. The fix (take the directory from
+`systemd.pc`) is on the `packaging/debian12-units` branch of
+<https://github.com/ciroiriarte/mhvtl> and not yet proposed upstream.
 
 All x86_64. RHEL 10 and its rebuilds need an x86-64-v3 CPU (Intel Haswell,
 AMD Zen or newer); that is a requirement of the distribution, not of mhVTL.
@@ -125,6 +134,30 @@ work). Check, and install it if needed:
 modinfo st >/dev/null 2>&1 || apt-get install linux-modules-extra-$(uname -r)
 ```
 
+### Proxmox VE 9 and 8
+
+Proxmox VE runs its own kernel, and there is no `linux-headers-$(uname -r)` package for
+it. Install Proxmox's header metapackage **before** mhVTL, so DKMS finds the
+headers of the running kernel:
+
+```sh
+apt-get install proxmox-default-headers
+```
+
+Then follow the Debian steps above without `linux-headers-$(uname -r)`: use
+`Debian_13` for Proxmox VE 9 and `Debian_12` for Proxmox VE 8 (see the note
+under *Supported releases*).
+
+Installing mhVTL first does not work on Proxmox VE 8. There, Debian's `dkms` package
+recommends `linux-headers-amd64 | linux-headers-generic | linux-headers`, and
+apt satisfies that with an old `pve-headers` package that does not match the
+running kernel. DKMS then has no headers to build against.
+
+Without a subscription, the `pve-enterprise` (and, on Proxmox VE 9, `ceph`
+enterprise) repositories return 401 and `apt-get update` fails. Disable them
+or switch to the `pve-no-subscription` repository first:
+<https://pve.proxmox.com/wiki/Package_Repositories>.
+
 ## Start and check
 
 The packages do not start mhVTL on their own: it needs a configured library
@@ -210,6 +243,15 @@ with its media after `systemctl enable` and a reboot; clean removal.
 | Debian 13 | 6.12.111+deb13-amd64 | pass |
 | Ubuntu 24.04.5 | 6.8.0-147-generic | pass (with `linux-modules-extra`) |
 | Ubuntu 26.04.1 | 7.0.0-38-generic | pass |
+| Proxmox VE 9.2.21 | 7.0.14-24-pve | pass (`proxmox-default-headers` first) |
+
+Built from the `packaging/debian12-units` branch (same sources plus the unit
+directory fix), 2026-10-15/16, because `Debian_12` does not publish yet:
+
+| Release | Kernel | Result |
+|---|---|---|
+| Debian 12 | 6.1.0-53-amd64 | pass |
+| Proxmox VE 8.4.21 | 6.8.12-43-pve | pass (`proxmox-default-headers` first) |
 
 Not covered: RHEL itself (the Rocky and Alma builds are expected to work
 there; OBS has no RHEL 9/10 build target), Secure Boot, aarch64, upgrades
