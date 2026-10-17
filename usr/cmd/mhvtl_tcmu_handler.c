@@ -17,6 +17,11 @@
  *   4. Worker thread maps LUN (handles INQUIRY from UIO)
  *   5. Worker thread relays CDBs: UIO ring ↔ daemon socket
  *
+ * When a daemon goes away, its worker fails the commands left in the ring
+ * and then answers new ones itself with an error. A daemon that registers
+ * again for the same minor reuses the backstore and LUN, which LIO cannot
+ * re-enable.
+ *
  */
 
 #include <stdio.h>
@@ -67,6 +72,7 @@ struct handler_device {
 	pthread_t              thread;
 	pthread_mutex_t        lock;
 	int                    ready;       /* UIO connected, LUN mapped */
+	int                    daemon_lost; /* socket to daemon failed */
 };
 
 static struct handler_device devices[MAX_DEVICES];
@@ -86,6 +92,17 @@ static int configfs_write(const char *path, const char *val)
 	int e = errno;
 	close(fd);
 	if (r < 0) { errno = e; return -1; }
+	return 0;
+}
+
+static int configfs_read(const char *path, char *buf, size_t len)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) return -1;
+	ssize_t r = read(fd, buf, len - 1);
+	close(fd);
+	if (r < 0) return -1;
+	buf[r] = '\0';
 	return 0;
 }
 
@@ -125,7 +142,9 @@ static int dev_added(struct tcmu_device *dev)
 
 	struct handler_device *d = &devices[minor];
 	pthread_mutex_lock(&d->lock);
-	if (d->active && !d->tcmu_dev) {
+	/* Keep the device even with no daemon registered: it outlives the
+	 * daemon, and a daemon that registers again reuses it. */
+	if (!d->tcmu_dev) {
 		d->tcmu_dev = dev;
 		MHVTL_LOG("TCMU device added for minor %u: %s", minor, cfg);
 	}
@@ -180,13 +199,16 @@ static void *lun_map_thread(void *arg)
  * the initiator as a full buffer of zeros.
  *
  * struct tcmu_device is opaque from the public libtcmu API, but its
- * first member after fd is the map pointer. We use an ABI-compatible
- * partial struct to access it.
+ * first members are fd, map, map_len and libtcmu's private cmd_tail
+ * (libtcmu_priv.h, the same in v1.5.4 and v1.6.2). We use an
+ * ABI-compatible partial struct to access them.
  */
 struct tcmu_device_abi {
 	int fd;
 	struct tcmu_mailbox *map;
-	/* remaining fields omitted — we only need map */
+	size_t map_len;
+	uint32_t cmd_tail;
+	/* remaining fields omitted */
 };
 
 static void set_read_len_on_current_entry(struct tcmu_device *dev,
@@ -234,27 +256,20 @@ static void relay_one_batch(struct handler_device *d)
 		msg.cmd_id = (uint64_t)(uintptr_t)cmd;
 		memcpy(msg.cdb, cmd->cdb, TCMU_MAX_CDB_SIZE);
 
-		if (send_msg(d->daemon_fd, &msg, sizeof(msg)) < 0) {
-			MHVTL_ERR("[%s] socket write failed", d->bs_name);
-			tcmulib_command_complete(d->tcmu_dev, cmd,
-						TCMU_STS_NOT_HANDLED);
-			continue;
-		}
+		if (send_msg(d->daemon_fd, &msg, sizeof(msg)) < 0)
+			goto lost;
 
 		struct tcmu_msg_hdr resp_hdr;
-		if (recv_msg(d->daemon_fd, &resp_hdr, sizeof(resp_hdr)) < 0) {
-			MHVTL_ERR("[%s] socket read failed", d->bs_name);
-			tcmulib_command_complete(d->tcmu_dev, cmd,
-						TCMU_STS_NOT_HANDLED);
-			continue;
-		}
+		if (recv_msg(d->daemon_fd, &resp_hdr, sizeof(resp_hdr)) < 0)
+			goto lost;
 
 		if (resp_hdr.type == MSG_DATA_REQ) {
 			struct tcmu_msg_data_req dreq;
 			memcpy(&dreq.hdr, &resp_hdr, sizeof(resp_hdr));
-			recv_msg(d->daemon_fd,
-				 ((uint8_t *)&dreq) + sizeof(resp_hdr),
-				 sizeof(dreq) - sizeof(resp_hdr));
+			if (recv_msg(d->daemon_fd,
+				     ((uint8_t *)&dreq) + sizeof(resp_hdr),
+				     sizeof(dreq) - sizeof(resp_hdr)) < 0)
+				goto lost;
 
 			uint32_t dlen = dreq.data_len;
 			if (dlen > TCMU_MAX_DATA_SIZE) dlen = TCMU_MAX_DATA_SIZE;
@@ -267,24 +282,33 @@ static void relay_one_batch(struct handler_device *d)
 				dout.hdr.data_len = sizeof(dout) - sizeof(dout.hdr) + dlen;
 				dout.cmd_id = dreq.cmd_id;
 				dout.data_len = dlen;
-				send_msg(d->daemon_fd, &dout, sizeof(dout));
-				send_msg(d->daemon_fd, buf, dlen);
+				if (send_msg(d->daemon_fd, &dout, sizeof(dout)) < 0 ||
+				    send_msg(d->daemon_fd, buf, dlen) < 0) {
+					free(buf);
+					goto lost;
+				}
 				free(buf);
 			}
-			recv_msg(d->daemon_fd, &resp_hdr, sizeof(resp_hdr));
+			if (recv_msg(d->daemon_fd, &resp_hdr, sizeof(resp_hdr)) < 0)
+				goto lost;
 		}
 
 		if (resp_hdr.type == MSG_CDB_RESP) {
 			struct tcmu_msg_cdb_resp resp;
 			memcpy(&resp.hdr, &resp_hdr, sizeof(resp_hdr));
-			recv_msg(d->daemon_fd,
-				 ((uint8_t *)&resp) + sizeof(resp_hdr),
-				 sizeof(resp) - sizeof(resp_hdr));
+			if (recv_msg(d->daemon_fd,
+				     ((uint8_t *)&resp) + sizeof(resp_hdr),
+				     sizeof(resp) - sizeof(resp_hdr)) < 0)
+				goto lost;
 
 			if (resp.data_len > 0) {
 				uint8_t *buf = malloc(resp.data_len);
 				if (buf) {
-					recv_msg(d->daemon_fd, buf, resp.data_len);
+					if (recv_msg(d->daemon_fd, buf,
+						     resp.data_len) < 0) {
+						free(buf);
+						goto lost;
+					}
 					tcmu_memcpy_into_iovec(cmd->iovec, cmd->iov_cnt,
 							       buf, resp.data_len);
 					free(buf);
@@ -320,6 +344,83 @@ static void relay_one_batch(struct handler_device *d)
 	}
 
 	tcmulib_processing_complete(d->tcmu_dev);
+	return;
+
+lost:
+	/* Leave this command and the rest of the ring uncompleted;
+	 * fail_ring() fails them. */
+	MHVTL_ERR("[%s] lost the daemon socket", d->bs_name);
+	free(cmd);
+	d->daemon_lost = 1;
+	tcmulib_processing_complete(d->tcmu_dev);
+}
+
+static int backstore_action(struct handler_device *d, const char *action,
+			    const char *val)
+{
+	char path[512];
+
+	snprintf(path, sizeof(path),
+		 CONFIGFS_TARGET "/core/user_0/%s/action/%s", d->bs_name, action);
+	if (configfs_write(path, val) < 0) {
+		MHVTL_ERR("[%s] %s=%s failed: %s", d->bs_name, action, val,
+			  strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Fail the commands the lost daemon left in the ring.
+ *
+ * Nothing else fails them: closing the UIO device does not complete
+ * commands still in the ring, and they would wait for cmd_time_out.
+ * reset_ring=2 completes every command in the ring with CHECK CONDITION
+ * and sets the mailbox head and tail to 0 (tcmu_reset_ring() in
+ * drivers/target/target_core_user.c). Blocking around it also fails
+ * commands waiting for ring space. libtcmu does the same for a stale
+ * ring when it opens a device, then sets its private tail from the
+ * mailbox; we have to do that last step ourselves.
+ */
+static void fail_ring(struct handler_device *d)
+{
+	struct tcmu_device_abi *abi = (struct tcmu_device_abi *)d->tcmu_dev;
+
+	backstore_action(d, "block_dev", "1");
+	if (backstore_action(d, "reset_ring", "2") == 0)
+		abi->cmd_tail = abi->map->cmd_tail;
+	backstore_action(d, "block_dev", "0");
+	MHVTL_LOG("[%s] Ring reset", d->bs_name);
+}
+
+/*
+ * With no daemon, answer every command at once with NOT READY, LOGICAL
+ * UNIT COMMUNICATION FAILURE, as LIO does for a broken TCMU device. A
+ * blocked device would answer BUSY instead, which the initiator retries
+ * for as long as the command timeout allows.
+ */
+static void serve_without_daemon(struct handler_device *d, int dev_fd)
+{
+	struct tcmulib_cmd *cmd;
+
+	MHVTL_LOG("[%s] No daemon, failing commands until one registers",
+		  d->bs_name);
+	while (running && d->active) {
+		struct pollfd pfd = { .fd = dev_fd, .events = POLLIN };
+		if (poll(&pfd, 1, 500) <= 0)
+			continue;
+		tcmulib_processing_start(d->tcmu_dev);
+		while ((cmd = tcmulib_get_next_command(d->tcmu_dev, 0))) {
+			memset(cmd->sense_buf, 0, sizeof(cmd->sense_buf));
+			cmd->sense_buf[0] = 0x70;	/* fixed format, current */
+			cmd->sense_buf[2] = 0x02;	/* NOT READY */
+			cmd->sense_buf[7] = 0x0a;
+			cmd->sense_buf[12] = 0x08;	/* LU communication failure */
+			tcmulib_command_complete(d->tcmu_dev, cmd,
+						 TCMU_STS_PASSTHROUGH_ERR);
+		}
+		tcmulib_processing_complete(d->tcmu_dev);
+	}
 }
 
 /* ---- Per-device worker thread ---- */
@@ -329,6 +430,7 @@ static void *device_worker(void *arg)
 	struct handler_device *d = arg;
 	char path[512], value[128];
 	int dev_fd;
+	int reused = 0;
 
 	MHVTL_LOG("[%s] Worker started", d->bs_name);
 
@@ -340,6 +442,21 @@ static void *device_worker(void *arg)
 	if (mkdir(path, 0755) < 0 && errno != EEXIST) {
 		MHVTL_ERR("[%s] mkdir backstore: %s", d->bs_name, strerror(errno));
 		goto err;
+	}
+
+	/*
+	 * A backstore left by an earlier daemon for this minor is still
+	 * enabled. LIO accepts only "1" for enable and refuses it on a
+	 * configured device (target_dev_enable_store() and
+	 * target_configure_device()), so reuse the backstore as it is.
+	 */
+	snprintf(path, sizeof(path),
+		 CONFIGFS_TARGET "/core/user_0/%s/enable", d->bs_name);
+	if (configfs_read(path, value, sizeof(value)) == 0 && value[0] == '1') {
+		reused = 1;
+		MHVTL_LOG("[%s] Backstore already enabled, reusing it",
+			  d->bs_name);
+		goto wait_uio;
 	}
 
 	snprintf(path, sizeof(path),
@@ -361,16 +478,14 @@ static void *device_worker(void *arg)
 	 * We're in a worker thread, so we don't hold the socket —
 	 * no deadlock. Same pattern as tcmu-runner.
 	 */
-	/* Disable first in case backstore is stale from a previous run */
 	snprintf(path, sizeof(path),
 		 CONFIGFS_TARGET "/core/user_0/%s/enable", d->bs_name);
-	configfs_write(path, "0");
-
 	if (configfs_write(path, "1") < 0) {
 		MHVTL_ERR("[%s] enable failed: %s", d->bs_name, strerror(errno));
 		goto err;
 	}
 
+wait_uio:
 	/* Wait for main thread to process netlink and set tcmu_dev */
 	{
 		int waited = 0;
@@ -420,6 +535,18 @@ static void *device_worker(void *arg)
 			 target_wwn, lun_idx);
 		mkdir(lun_dir, 0755);
 
+		snprintf(link_path, sizeof(link_path), "%s/%s", lun_dir, d->bs_name);
+		snprintf(bs_path, sizeof(bs_path),
+			 CONFIGFS_TARGET "/core/user_0/%s", d->bs_name);
+
+		/* A reused backstore is still mapped. Keep the LUN, so the
+		 * host keeps its st and sg nodes for the drive. */
+		struct stat lst;
+		if (reused && lstat(link_path, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+			MHVTL_LOG("[%s] LUN %u already mapped", d->bs_name, lun_idx);
+			goto mapped;
+		}
+
 		/* Remove stale symlinks */
 		DIR *ld = opendir(lun_dir);
 		if (ld) {
@@ -434,9 +561,6 @@ static void *device_worker(void *arg)
 			closedir(ld);
 		}
 
-		snprintf(link_path, sizeof(link_path), "%s/%s", lun_dir, d->bs_name);
-		snprintf(bs_path, sizeof(bs_path),
-			 CONFIGFS_TARGET "/core/user_0/%s", d->bs_name);
 
 		/* The symlink triggers INQUIRY. We spawn a thread for
 		 * the blocking symlink while the worker handles INQUIRY
@@ -469,6 +593,7 @@ static void *device_worker(void *arg)
 			MHVTL_ERR("[%s] LUN mapping failed", d->bs_name);
 	}
 
+mapped:
 	d->ready = 1;
 	MHVTL_LOG("[%s] Device ready — relaying CDBs", d->bs_name);
 
@@ -476,12 +601,31 @@ static void *device_worker(void *arg)
 	 * Step 4: CDB relay loop.
 	 * Read CDB from UIO ring, send to daemon, get response, complete.
 	 */
-	while (running && d->active) {
-		struct pollfd pfd = { .fd = dev_fd, .events = POLLIN };
-		int ret = poll(&pfd, 1, 1000);
+	while (running && d->active && !d->daemon_lost) {
+		struct pollfd pfd[2] = {
+			{ .fd = dev_fd, .events = POLLIN },
+			{ .fd = d->daemon_fd, .events = POLLIN },
+		};
+		int ret = poll(pfd, 2, 1000);
 		if (ret <= 0)
 			continue;
-		relay_one_batch(d);
+		/* The daemon only writes in reply to a CDB, so anything on
+		 * its socket between commands means it has gone. */
+		if (pfd[1].revents) {
+			MHVTL_LOG("[%s] Daemon closed its socket", d->bs_name);
+			d->daemon_lost = 1;
+			break;
+		}
+		if (pfd[0].revents)
+			relay_one_batch(d);
+	}
+
+	/* The daemon is gone but the handler is not stopping. Keep the
+	 * ring serviced until a replacement daemon registers; main()
+	 * stops this worker before starting the next one. */
+	if (running && d->daemon_lost && d->ready) {
+		fail_ring(d);
+		serve_without_daemon(d, dev_fd);
 	}
 
 err:
@@ -699,6 +843,16 @@ int main(int argc, char *argv[])
 			}
 
 			struct handler_device *d = &devices[reg.minor];
+
+			/* A new daemon for this minor means the old one has
+			 * exited. Stop the old worker, which is failing
+			 * commands in its place. */
+			if (d->thread) {
+				d->active = 0;
+				pthread_join(d->thread, NULL);
+				d->thread = 0;
+			}
+
 			pthread_mutex_lock(&d->lock);
 			d->active = 1;
 			d->daemon_fd = client_fd;
@@ -708,8 +862,8 @@ int main(int argc, char *argv[])
 			d->target = reg.target;
 			d->lun = reg.lun;
 			strncpy(d->bs_name, reg.bs_name, sizeof(d->bs_name) - 1);
-			d->tcmu_dev = NULL;
 			d->ready = 0;
+			d->daemon_lost = 0;
 			pthread_mutex_unlock(&d->lock);
 
 			MHVTL_LOG("Daemon registered: %s (minor=%u, type=%d, %u:%u:%u)",
