@@ -39,6 +39,7 @@ enum tcmu_msg_type {
 	MSG_DATA_REQ      = 6,  /* daemon → handler: send me DATA-OUT */
 	MSG_DATA_OUT      = 7,  /* handler → daemon: here's DATA-OUT data */
 	MSG_SHUTDOWN      = 8,  /* handler → daemon: device going away */
+	MSG_HANDOFF       = 9,  /* handler → daemon: UIO fd attached (SCM_RIGHTS); cmd_id = map length */
 };
 
 /* Common header for all messages */
@@ -56,7 +57,10 @@ struct tcmu_msg_register {
 	uint32_t target;        /* SCSI target from device.conf */
 	uint32_t lun;           /* SCSI LUN from device.conf */
 	char     bs_name[32];   /* backstore name: "tape11" or "lib10" */
+	uint32_t flags;         /* TCMU_REG_* */
 };
+
+#define TCMU_REG_DIRECT 0x1     /* daemon takes the UIO ring over after LUN mapping */
 
 /* MSG_CDB: handler sends a SCSI command to the daemon */
 struct tcmu_msg_cdb {

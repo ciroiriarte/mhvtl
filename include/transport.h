@@ -82,6 +82,7 @@ extern struct vtl_transport *vtl_transport;
 struct vtl_transport *transport_mhvtl_init(void);
 #ifdef MHVTL_TCMU_BACKEND
 struct vtl_transport *transport_tcmu_init(void);
+struct vtl_transport *transport_tcmu_direct_init(const char *mode);
 #endif
 #ifdef MHVTL_USERLAND_BACKEND
 struct vtl_transport *transport_userland_init(void);

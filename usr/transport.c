@@ -27,6 +27,12 @@ void transport_select(void)
 
 #ifdef MHVTL_TCMU_BACKEND
 	if (strcmp(env, "tcmu") == 0) {
+		const char *direct = getenv("MHVTL_TCMU_DIRECT");
+		if (direct && direct[0]) {
+			vtl_transport = transport_tcmu_direct_init(direct);
+			MHVTL_DBG(1, "Selected TCMU direct-ring transport (%s)", direct);
+			return;
+		}
 		vtl_transport = transport_tcmu_init();
 		MHVTL_DBG(1, "Selected TCMU transport backend");
 		return;

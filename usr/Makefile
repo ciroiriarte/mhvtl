@@ -144,8 +144,9 @@ TRANSPORT_OBJ = transport.o transport_mhvtl.o transport_userland.o
 
 ifdef TCMU
 CFLAGS += -DMHVTL_TCMU_BACKEND
-TRANSPORT_OBJ += transport_tcmu.o
+TRANSPORT_OBJ += transport_tcmu.o transport_tcmu_direct.o
 transport_tcmu.o: CFLAGS += -fpic
+transport_tcmu_direct.o: CFLAGS += -fpic
 endif
 
 libvtlscsi.so: vtllib.o mhvtl_log.o mode.o \

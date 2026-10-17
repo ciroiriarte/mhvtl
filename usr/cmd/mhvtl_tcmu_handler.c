@@ -67,6 +67,7 @@ struct handler_device {
 	pthread_t              thread;
 	pthread_mutex_t        lock;
 	int                    ready;       /* UIO connected, LUN mapped */
+	int                    direct;      /* hand the UIO fd to the daemon */
 };
 
 static struct handler_device devices[MAX_DEVICES];
@@ -186,6 +187,7 @@ static void *lun_map_thread(void *arg)
 struct tcmu_device_abi {
 	int fd;
 	struct tcmu_mailbox *map;
+	size_t map_len;
 	/* remaining fields omitted — we only need map */
 };
 
@@ -320,6 +322,41 @@ static void relay_one_batch(struct handler_device *d)
 	}
 
 	tcmulib_processing_complete(d->tcmu_dev);
+}
+
+/*
+ * Pass the UIO fd to the daemon so it works on the ring itself. Every
+ * relayed command has completed by now, so libtcmu's private tail and
+ * the mailbox cmd_tail agree and the daemon carries on from cmd_tail.
+ */
+static int hand_off_uio(struct handler_device *d, int dev_fd)
+{
+	struct tcmu_device_abi *abi = (struct tcmu_device_abi *)d->tcmu_dev;
+	struct tcmu_msg_cdb msg;
+	char cbuf[CMSG_SPACE(sizeof(int))];
+	struct iovec iov = { .iov_base = &msg, .iov_len = sizeof(msg) };
+	struct msghdr mh = {
+		.msg_iov = &iov, .msg_iovlen = 1,
+		.msg_control = cbuf, .msg_controllen = sizeof(cbuf),
+	};
+	struct cmsghdr *c;
+
+	memset(&msg, 0, sizeof(msg));
+	memset(cbuf, 0, sizeof(cbuf));
+	msg.hdr.type = MSG_HANDOFF;
+	msg.hdr.data_len = sizeof(msg) - sizeof(msg.hdr);
+	msg.cmd_id = abi->map_len;
+	c = CMSG_FIRSTHDR(&mh);
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type = SCM_RIGHTS;
+	c->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(c), &dev_fd, sizeof(int));
+
+	if (sendmsg(d->daemon_fd, &mh, 0) != (ssize_t)sizeof(msg))
+		return -1;
+	MHVTL_LOG("[%s] UIO handed to daemon (map %zu bytes)", d->bs_name,
+		  abi->map_len);
+	return 0;
 }
 
 /* ---- Per-device worker thread ---- */
@@ -470,6 +507,22 @@ static void *device_worker(void *arg)
 	}
 
 	d->ready = 1;
+
+	if (d->direct) {
+		if (hand_off_uio(d, dev_fd) == 0) {
+			/* The daemon owns the ring now; wait for it to go away. */
+			while (running && d->active) {
+				struct pollfd pfd = { .fd = d->daemon_fd,
+						      .events = POLLIN };
+				char c;
+				if (poll(&pfd, 1, 1000) > 0 &&
+				    recv(d->daemon_fd, &c, 1, MSG_DONTWAIT) <= 0)
+					break;
+			}
+			goto err;
+		}
+		MHVTL_ERR("[%s] hand-off failed, relaying instead", d->bs_name);
+	}
 	MHVTL_LOG("[%s] Device ready — relaying CDBs", d->bs_name);
 
 	/*
@@ -707,6 +760,7 @@ int main(int argc, char *argv[])
 			d->channel = reg.channel;
 			d->target = reg.target;
 			d->lun = reg.lun;
+			d->direct = (reg.flags & TCMU_REG_DIRECT) != 0;
 			strncpy(d->bs_name, reg.bs_name, sizeof(d->bs_name) - 1);
 			d->tcmu_dev = NULL;
 			d->ready = 0;
